@@ -26,7 +26,7 @@
       </div>
       <div style="width:1px;height:28px;background:rgba(255,255,255,0.1);"></div>
       <div style="text-align:center;">
-        <div style="color:#fff;font-size:16px;line-height:1.2;">{{ satellites.length }}</div>
+        <div style="color:#fff;font-size:16px;line-height:1.2;">{{ satelliteCount }}</div>
         <div style="color:#8b949e;font-size:9px;letter-spacing:2px;">TRACKED</div>
       </div>
       <div style="width:1px;height:28px;background:rgba(255,255,255,0.1);"></div>
@@ -36,12 +36,20 @@
       </div>
       <div style="width:1px;height:28px;background:rgba(255,255,255,0.1);"></div>
       <div style="text-align:center;">
-        <div style="color:#d29922;font-size:16px;line-height:1.2;">{{ riskLevel }}</div>
-        <div style="color:#8b949e;font-size:9px;letter-spacing:2px;">RISK</div>
+        <div style="color:#d29922;font-size:16px;line-height:1.2;">{{ rocketCount }}</div>
+        <div style="color:#8b949e;font-size:9px;letter-spacing:2px;">ROCKETS</div>
       </div>
     </div>
 
     <div style="display:flex;align-items:center;gap:10px;">
+      <select v-model="selectedFile" @change="onFileChange"
+              style="background:rgba(0,0,0,0.4);border:1px solid rgba(88,166,255,0.3);border-radius:4px;
+                     color:#58a6ff;font-size:11px;font-weight:700;padding:4px 8px;outline:none;cursor:pointer;">
+        <option value="" disabled>Select Source File</option>
+        <option value="ALL">All Files (Entire Directory)</option>
+        <option v-for="file in availableFiles" :key="file" :value="file">{{ file }}</option>
+      </select>
+
       <div :style="{ background: riskLevel === 'HIGH' ? 'rgba(248,81,73,0.15)' : 'rgba(46,160,67,0.15)',
                      border: riskLevel === 'HIGH' ? '1px solid rgba(248,81,73,0.4)' : '1px solid rgba(46,160,67,0.4)',
                      padding:'3px 10px', borderRadius:'4px', display:'flex', alignItems:'center', gap:'5px' }">
@@ -241,9 +249,10 @@
               <span style="font-size:9px;color:#f85149;font-family:'Courier New',monospace;">{{ ev.tca }}</span>
             </div>
             <div style="display:flex;justify-content:space-between;font-size:8px;color:#c9d1d9;">
-              <span>Pc: {{ ev.probability }}</span>
-              <span>Eng: {{ ev.kineticEnergy }}</span>
+              <span>Risk: {{ ev.probability }}</span>
+              <span>{{ ev.kineticEnergy }}</span>
             </div>
+            <div style="font-size:8px;color:#d29922;margin-top:4px;">Threat: {{ ev.hazard_name }}</div>
           </div>
         </div>
       </div>
@@ -259,25 +268,56 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 
 const props = defineProps({
   satellites: { type: Array, default: () => [] },
   time:       { type: String, default: '' },
+  satelliteCount:{ type: Number, default: 0 },
+  rocketCount:{ type: Number, default: 0 },
   debrisCount:{ type: Number, default: 0 },
   riskLevel:  { type: String, default: 'LOW' },
 });
 
 const emit = defineEmits(['select', 'layer-change', 'simulate-start', 'simulate-end', 'play-collision']);
 
+const availableFiles = ref([]);
+const selectedFile = ref('');
+
+onMounted(async () => {
+  try {
+    const res = await fetch('http://127.0.0.1:8000/files');
+    const data = await res.json();
+    if (data.files && data.files.length > 0) {
+      availableFiles.value = data.files;
+      // We don't automatically trigger reload here since backend starts with a default, 
+      // but we set the UI dropdown to the first item (which is usually what's loaded)
+      selectedFile.value = data.files[0];
+    }
+  } catch (e) {
+    console.error("Failed to load files", e);
+  }
+});
+
+async function onFileChange() {
+  if (!selectedFile.value) return;
+  try {
+    const filenameParam = selectedFile.value === 'ALL' ? '' : `?filename=${encodeURIComponent(selectedFile.value)}`;
+    await fetch(`http://127.0.0.1:8000/reload${filenameParam}`, {
+      method: 'POST'
+    });
+  } catch (e) {
+    console.error("Failed to reload file", e);
+  }
+}
+
 const activeTab = ref('payloads');
 const search    = ref('');
 
 const layers = ref({
-  constellation: { label: 'Constellation',  on: true  },
-  network:       { label: 'Network Paths',   on: true  },
-  debris:        { label: 'Debris Objects',  on: true  },
-  orbits:        { label: 'Orbit Tracks',    on: false },
+  satellites:   { label: 'Satellites',    on: true },
+  rocketBodies: { label: 'Rocket Bodies', on: true },
+  debris:       { label: 'Debris',        on: true },
 });
 
 function toggleLayer(key) {
@@ -310,13 +350,14 @@ async function runSimulation() {
     
     const events = [];
     if (data.high_risk_zones && data.high_risk_zones.length > 0) {
-      data.high_risk_zones.forEach((zone, idx) => {
+      data.high_risk_zones.forEach((ev, idx) => {
         events.push({
           id: idx,
-          satellite: { name: `Zone ${zone.altitude_range}` },
-          tca: `${zone.congestion_events} Collisions`,
-          probability: data.global_risk_index.toFixed(2),
-          kineticEnergy: `Trend: ${data.trend}`,
+          satellite: ev.satellite,
+          tca: ev.tca,
+          probability: ev.probability,
+          kineticEnergy: ev.kineticEnergy,
+          hazard_name: ev.hazard_name
         });
       });
     }

@@ -2,18 +2,18 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from simulation import Simulator
 from prediction import run_prediction
-import json
 import uvicorn
 import os
 import logging
+import json
 
-# 1. Setup logging to track what's happening in the background
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("OrbitalShield")
 
 app = FastAPI()
 
-# 2. Allow the Frontend (Vue/Cesium) to talk to this API
+# Allow Frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,45 +21,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Path to your source data directory
 DATA_DIR = "source_data"
-
-# 4. Global simulator instance
 sim = None
 
-def init_simulator():
+def init_simulator(target_path=None):
+    """
+    Initializes the global Simulator instance with the target CSV or directory.
+    """
     global sim
-    if os.path.exists(DATA_DIR):
-        logger.info(f"Loading records from directory {DATA_DIR}...")
+    path_to_load = target_path if target_path else DATA_DIR
+    if os.path.exists(path_to_load):
+        logger.info(f"Loading records from path {path_to_load}...")
         try:
-            sim = Simulator(DATA_DIR)
+            sim = Simulator(path_to_load)
             logger.info("Simulator initialized successfully.")
         except Exception as e:
             logger.error(f"Failed to load Simulator: {e}")
     else:
-        logger.warning(f"Directory {DATA_DIR} not found! Please create it and add your CSV files.")
+        logger.warning(f"Path {path_to_load} not found!")
 
 # Initialize on startup
 init_simulator()
 
 @app.get("/predict")
 async def predict_risk(time_horizon_years: int = Query(50, description="Time horizon in years")):
+    """
+    Triggers the Advanced Time-Aware Prediction Engine to forecast risks.
+    """
     if not sim or sim.df.empty:
         return {"error": "No simulation data available."}
     try:
-        result = run_prediction(sim.df, time_horizon_years)
+        result = run_prediction(sim.df, sim.sim_time, time_horizon_years)
         return result
     except Exception as e:
         logger.error(f"Prediction failed: {e}")
         return {"error": str(e)}
 
+@app.get("/files")
+async def list_files():
+    """Returns a list of CSV files available in the source_data directory."""
+    try:
+        if not os.path.exists(DATA_DIR):
+            return {"files": []}
+        files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
+        return {"files": files}
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        return {"error": str(e)}
+
 @app.post("/reload")
-async def reload_data():
+async def reload_data(filename: str = Query(None, description="Specific CSV filename to load")):
     """
-    Endpoint to reload all CSV files from the source_data directory.
+    Endpoint to reload CSV files dynamically without restarting the server.
     """
     try:
-        init_simulator()
+        if filename:
+            target_path = os.path.join(DATA_DIR, filename)
+            init_simulator(target_path)
+        else:
+            init_simulator()
+
         if sim and not sim.df.empty:
             return {"status": "success", "message": f"Successfully loaded {len(sim.df)} objects."}
         else:
@@ -70,33 +91,24 @@ async def reload_data():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    Main communication channel between the physics engine and the 3D UI.
+    Main bi-directional communication channel between the physics engine and the 3D UI.
     """
     await websocket.accept()
     logger.info("Frontend connected to WebSocket.")
     
     try:
-        # Step 1: Send the first batch of positions (Time: Now)
         if sim:
             initial_data = sim.advance(0)
-            logger.info(
-                        f"Sending {len(initial_data['positions'])} objects to frontend."
-                    )
+            logger.info(f"Sending {len(initial_data['positions'])} objects to frontend.")
             await websocket.send_json(initial_data)
         
-        # Step 2: Listen for commands from the UI
         while True:
             raw_data = await websocket.receive_text()
             message = json.loads(raw_data)
             
-            # If UI asks to move the simulation forward
             if message.get('action') == 'advance':
                 minutes = message.get('minutes', 1)
-                
-                # Physics calculation for all 10,000 objects
                 updated_state = sim.advance(minutes)
-                
-                # Send back to Frontend
                 await websocket.send_json(updated_state)
                 
     except WebSocketDisconnect:

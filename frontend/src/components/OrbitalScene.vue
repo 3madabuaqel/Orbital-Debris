@@ -6,9 +6,11 @@
       v-if="!activeSat && !isExploding"
       :satellites="satellites"
       :time="utcTime"
+      :satellite-count="currentSatelliteCount"
+      :rocket-count="currentRocketCount"
       :debris-count="currentDebrisCount"
-      :risk-level="'NOMINAL'"
       @select="enterCockpit"
+      @play-collision="onPlayCollision"
       @layer-change="onLayerChange"
       @simulate-start="timeScale = 30"
       @simulate-end="timeScale = 1"
@@ -43,11 +45,11 @@ import GlobalHUD from './GlobalHUD.vue';
 import CockpitHUD from './CockpitHUD.vue';
 
 import { EARTH_RADIUS } from '../physics/OrbitalPhysics.js';
-import { buildEarth, buildLights, buildStarfield, buildSatelliteCloud, buildCubeSat } from '../scene/SceneBuilder.js';
+import { buildEarth, buildLights, buildStarfield, buildInstancedSatellites, buildCubeSat } from '../scene/SceneBuilder.js';
 import { tickExplosion } from '../scene/DebrisSystem.js';
 
-// 30 (Earth Mesh Radius) / 6371 (Earth Actual Radius in km)
-const SCALE_FACTOR = 0.004708837; 
+// Calculate exact scale factor so it perfectly matches the imported EARTH_RADIUS
+const SCALE_FACTOR = EARTH_RADIUS / 6371.0;
 
 const canvasMount = ref(null);
 const satellites = shallowRef([]);
@@ -57,15 +59,19 @@ const isExploding = ref(false);
 const timeScale = ref(1);
 const socket = ref(null);
 const rawOrbitalData = shallowRef([]);
+const currentSatelliteCount = ref(0);
+const currentRocketCount = ref(0);
 const currentDebrisCount = ref(0);
 
 const activeLayers = ref({
   satellites: true,
-  debris: true,
-  orbits: false
+  rocketBodies: true,
+  debris: true
 });
 
-let scene, camera, renderer, controls, earth, clouds, satPoints, cubeSat;
+let scene, camera, renderer, controls, earth, clouds, cubeSat;
+let payloadMesh, rocketMesh, debrisMesh;
+let meshMappings = { payload: [], rocket: [], debris: [] };
 let explosionParticles = [];
 let lastSatPos = new THREE.Vector3();
 let raycaster = new THREE.Raycaster();
@@ -73,6 +79,7 @@ let mouse = new THREE.Vector2();
 let frameCount = 0;
 let cockpitMode = false;
 let isWaitingForFrame = false;
+let collisionLine = null;
 
 raycaster.params.Points.threshold = 0.15;
 
@@ -123,8 +130,12 @@ function buildScene() {
   earth = earthObjs.earth;
   clouds = earthObjs.clouds;
 
-  // Initially empty, will be rebuilt when data arrives
-  satPoints = buildSatelliteCloud(scene, 0);
+  // Initially empty
+  const initialCounts = { payload: 0, rocket: 0, debris: 0 };
+  const meshes = buildInstancedSatellites(scene, initialCounts);
+  payloadMesh = meshes.payloadMesh;
+  rocketMesh = meshes.rocketMesh;
+  debrisMesh = meshes.debrisMesh;
 
   cubeSat = buildCubeSat(scene);
   cubeSat.visible = false;
@@ -183,12 +194,14 @@ function tick() {
     );
   }
 
-  if (rawOrbitalData.value?.length > 0) {
+  if (rawOrbitalData.value !== undefined) {
     updatePoints();
     
     // Sync Vue UI state synchronously with the render loop
-    currentDebrisCount.value = rawOrbitalData.value.length;
-    if (satellites.value.length === 0 || frameCount % 60 === 0) {
+    currentSatelliteCount.value = rawOrbitalData.value.filter(s => s.type === 'PAYLOAD').length;
+    currentRocketCount.value = rawOrbitalData.value.filter(s => s.type === 'ROCKET BODY').length;
+    currentDebrisCount.value = rawOrbitalData.value.filter(s => s.type !== 'PAYLOAD' && s.type !== 'ROCKET BODY').length;
+    if (rawOrbitalData.value.length === 0 || satellites.value.length === 0 || frameCount % 60 === 0) {
       satellites.value = rawOrbitalData.value;
     }
   }
@@ -196,6 +209,23 @@ function tick() {
   if (cockpitMode && activeSat.value) {
     cubeSat.position.copy(activeSat.value.pos);
     controls.target.copy(activeSat.value.pos);
+    
+    // Update collision line if active
+    if (collisionLine && activeSat.value.hazardName) {
+      const hazardData = rawOrbitalData.value.find(s => s.name === activeSat.value.hazardName);
+      if (hazardData) {
+        const getVisualPos = (sat) => {
+          const trueDist = Math.sqrt(sat.x*sat.x + sat.y*sat.y + sat.z*sat.z) * SCALE_FACTOR;
+          const trueAlt = trueDist - EARTH_RADIUS; 
+          const visualDist = EARTH_RADIUS + (trueAlt * 2.0); 
+          const ratio = visualDist / trueDist;
+          return new THREE.Vector3((sat.x * SCALE_FACTOR) * ratio, (sat.z * SCALE_FACTOR) * ratio, -(sat.y * SCALE_FACTOR) * ratio);
+        };
+        const pPos = activeSat.value.pos;
+        const hPos = getVisualPos(hazardData);
+        collisionLine.geometry.setFromPoints([pPos, hPos]);
+      }
+    }
   }
 
   if (earth) earth.rotation.y += 0.0001;
@@ -210,77 +240,123 @@ function tick() {
 
 function updatePoints() {
   const data = rawOrbitalData.value;
-  if (!data || data.length === 0) return;
-
-  const currentCount = satPoints ? satPoints.geometry.attributes.position.count : 0;
   
-  if (currentCount !== data.length) {
-    if (satPoints) {
-        scene.remove(satPoints);
-        satPoints.geometry.dispose();
-        satPoints.material.dispose();
-    }
-    satPoints = buildSatelliteCloud(scene, data.length);
-    satPoints.visible = !cockpitMode;
+  if (!data || data.length === 0) {
+    if (payloadMesh) { scene.remove(payloadMesh); payloadMesh.geometry.dispose(); payloadMesh.material.dispose(); payloadMesh = null; }
+    if (rocketMesh) { scene.remove(rocketMesh); rocketMesh.geometry.dispose(); rocketMesh.material.dispose(); rocketMesh = null; }
+    if (debrisMesh) { scene.remove(debrisMesh); debrisMesh.geometry.dispose(); debrisMesh.material.dispose(); debrisMesh = null; }
+    return;
   }
 
-  const positions = satPoints.geometry.attributes.position.array;
-  const colors = satPoints.geometry.attributes.color.array;
+  const currentPayloadCount = payloadMesh ? payloadMesh.count : 0;
+  const currentRocketCount = rocketMesh ? rocketMesh.count : 0;
+  const currentDebrisCount = debrisMesh ? debrisMesh.count : 0;
+
+  const actualPayloadCount = data.filter(s => s.type === 'PAYLOAD').length;
+  const actualRocketCount = data.filter(s => s.type === 'ROCKET BODY').length;
+  const actualDebrisCount = data.filter(s => s.type !== 'PAYLOAD' && s.type !== 'ROCKET BODY').length;
+
+  if (currentPayloadCount !== actualPayloadCount || currentRocketCount !== actualRocketCount || currentDebrisCount !== actualDebrisCount) {
+    if (payloadMesh) {
+      scene.remove(payloadMesh); payloadMesh.geometry.dispose(); payloadMesh.material.dispose();
+      scene.remove(rocketMesh); rocketMesh.geometry.dispose(); rocketMesh.material.dispose();
+      scene.remove(debrisMesh); debrisMesh.geometry.dispose(); debrisMesh.material.dispose();
+    }
+    const meshes = buildInstancedSatellites(scene, { payload: actualPayloadCount, rocket: actualRocketCount, debris: actualDebrisCount });
+    payloadMesh = meshes.payloadMesh;
+    rocketMesh = meshes.rocketMesh;
+    debrisMesh = meshes.debrisMesh;
+    meshMappings = { payload: [], rocket: [], debris: [] };
+  }
+
+  payloadMesh.visible = !cockpitMode;
+  rocketMesh.visible = !cockpitMode;
+  debrisMesh.visible = !cockpitMode;
+
+  const dummy = new THREE.Object3D();
+  let pIdx = 0, rIdx = 0, dIdx = 0;
 
   for (let i = 0; i < data.length; i++) {
     const sat = data[i];
+    if (!sat) continue;
 
-    if (sat) {
-      // 👁️ Layer Visibility
-      let isVisible = true;
-      if (sat.type === "PAYLOAD" && !activeLayers.value.satellites) isVisible = false;
-      if (sat.type !== "PAYLOAD" && !activeLayers.value.debris) isVisible = false;
+    let isVisible = true;
+    let targetMesh = null;
+    let idx = 0;
 
-      if (!isVisible) {
-        // Hide by collapsing to origin
-        positions[i * 3] = 0;
-        positions[i * 3 + 1] = 0;
-        positions[i * 3 + 2] = 0;
-        continue;
-      }
-
-      const x = sat.x * SCALE_FACTOR;
-      const y = sat.y * SCALE_FACTOR;
-      const z = sat.z * SCALE_FACTOR;
-
-      positions[i * 3] = x;
-      positions[i * 3 + 1] = y;
-      positions[i * 3 + 2] = z;
-
-      // 🎨 coloring حسب النوع
-      if (sat.type === "PAYLOAD") {
-        colors[i * 3] = 0.2;
-        colors[i * 3 + 1] = 0.8;
-        colors[i * 3 + 2] = 1.0;
-      } else {
-        colors[i * 3] = 1.0;
-        colors[i * 3 + 1] = 1.0;
-        colors[i * 3 + 2] = 0.2;
-      }
+    if (sat.type === 'PAYLOAD') {
+      isVisible = activeLayers.value.satellites;
+      targetMesh = payloadMesh;
+      idx = pIdx++;
+      meshMappings.payload[idx] = sat;
+    } else if (sat.type === 'ROCKET BODY') {
+      isVisible = activeLayers.value.rocketBodies;
+      targetMesh = rocketMesh;
+      idx = rIdx++;
+      meshMappings.rocket[idx] = sat;
+    } else {
+      isVisible = activeLayers.value.debris;
+      targetMesh = debrisMesh;
+      idx = dIdx++;
+      meshMappings.debris[idx] = sat;
     }
+
+    if (!isVisible) {
+      dummy.scale.set(0, 0, 0);
+    } else {
+      // Scale realistically based on RCS_SIZE from the CSV
+      let s = 0.12; // Base scale (reduced to be smaller)
+      if (sat.rcs_size === 'LARGE') s = 0.22;
+      else if (sat.rcs_size === 'MEDIUM') s = 0.12;
+      else if (sat.rcs_size === 'SMALL') s = 0.08;
+      
+      dummy.scale.set(s, s, s);
+      
+      // Calculate true distance in Three.js units
+      const trueDist = Math.sqrt(sat.x*sat.x + sat.y*sat.y + sat.z*sat.z) * SCALE_FACTOR;
+      const trueAlt = trueDist - EARTH_RADIUS; 
+      
+      // The visual atmosphere extends to EARTH_RADIUS + 0.8
+      // Multiply the true altitude by 2.0 to give a logical visual gap, avoiding the "stuck to Earth" illusion
+      const visualDist = EARTH_RADIUS + (trueAlt * 2.0); 
+      const ratio = visualDist / trueDist;
+
+      // Map Skyfield GCRS (Z-up) to Three.js (Y-up) and apply ratio
+      dummy.position.set(
+        (sat.x * SCALE_FACTOR) * ratio, 
+        (sat.z * SCALE_FACTOR) * ratio, 
+        -(sat.y * SCALE_FACTOR) * ratio 
+      );
+      dummy.lookAt(0, 0, 0); // Face Earth
+    }
+    dummy.updateMatrix();
+    targetMesh.setMatrixAt(idx, dummy.matrix);
   }
 
-  satPoints.geometry.attributes.position.needsUpdate = true;
-  satPoints.geometry.attributes.color.needsUpdate = true;
+  payloadMesh.instanceMatrix.needsUpdate = true;
+  rocketMesh.instanceMatrix.needsUpdate = true;
+  debrisMesh.instanceMatrix.needsUpdate = true;
 }
 
 function enterCockpit(sat) {
+  const trueDist = Math.sqrt(sat.x*sat.x + sat.y*sat.y + sat.z*sat.z) * SCALE_FACTOR;
+  const trueAlt = trueDist - EARTH_RADIUS; 
+  const visualDist = EARTH_RADIUS + (trueAlt * 2.0); 
+  const ratio = visualDist / trueDist;
+
   const target = new THREE.Vector3(
-    sat.x * SCALE_FACTOR,
-    sat.y * SCALE_FACTOR,
-    sat.z * SCALE_FACTOR
+    (sat.x * SCALE_FACTOR) * ratio,
+    (sat.z * SCALE_FACTOR) * ratio,
+    -(sat.y * SCALE_FACTOR) * ratio
   );
 
   activeSat.value = { ...sat, pos: target.clone() };
   cockpitMode = true;
 
   cubeSat.visible = true;
-  satPoints.visible = false;
+  if (payloadMesh) payloadMesh.visible = false;
+  if (rocketMesh) rocketMesh.visible = false;
+  if (debrisMesh) debrisMesh.visible = false;
 
   gsap.to(camera.position, {
     x: target.x + 5,
@@ -295,7 +371,9 @@ function exitCockpit() {
   activeSat.value = null;
 
   cubeSat.visible = false;
-  satPoints.visible = true;
+  if (payloadMesh) payloadMesh.visible = true;
+  if (rocketMesh) rocketMesh.visible = true;
+  if (debrisMesh) debrisMesh.visible = true;
 
   gsap.to(camera.position, {
     x: 0,
@@ -310,10 +388,22 @@ function onCanvasClick() {
 
   raycaster.setFromCamera(mouse, camera);
 
-  const intersects = raycaster.intersectObject(satPoints);
+  const meshes = [];
+  if (payloadMesh) meshes.push(payloadMesh);
+  if (rocketMesh) meshes.push(rocketMesh);
+  if (debrisMesh) meshes.push(debrisMesh);
+
+  const intersects = raycaster.intersectObjects(meshes);
 
   if (intersects.length > 0) {
-    const sat = rawOrbitalData.value[intersects[0].index];
+    const intersect = intersects[0];
+    const obj = intersect.object;
+    const instId = intersect.instanceId;
+
+    let sat;
+    if (obj === payloadMesh) sat = meshMappings.payload[instId];
+    else if (obj === rocketMesh) sat = meshMappings.rocket[instId];
+    else if (obj === debrisMesh) sat = meshMappings.debris[instId];
 
     if (sat) {
       enterCockpit(sat);
@@ -332,13 +422,59 @@ function onResize() {
   renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
+function onPlayCollision(ev) {
+  const payloadData = rawOrbitalData.value.find(s => s.name === ev.satellite?.name);
+  const hazardData = rawOrbitalData.value.find(s => s.name === ev.hazard_name);
+
+  if (!payloadData || !hazardData) {
+    alert("Objects not found in current orbital data frame.");
+    return;
+  }
+
+  // Remove existing line
+  if (collisionLine) {
+    scene.remove(collisionLine);
+    collisionLine.geometry.dispose();
+    collisionLine.material.dispose();
+  }
+
+  const getVisualPos = (sat) => {
+    const trueDist = Math.sqrt(sat.x*sat.x + sat.y*sat.y + sat.z*sat.z) * SCALE_FACTOR;
+    const trueAlt = trueDist - EARTH_RADIUS; 
+    const visualDist = EARTH_RADIUS + (trueAlt * 2.0); 
+    const ratio = visualDist / trueDist;
+    return new THREE.Vector3(
+      (sat.x * SCALE_FACTOR) * ratio,
+      (sat.z * SCALE_FACTOR) * ratio,
+      -(sat.y * SCALE_FACTOR) * ratio
+    );
+  };
+
+  const pPos = getVisualPos(payloadData);
+  const hPos = getVisualPos(hazardData);
+
+  const material = new THREE.LineBasicMaterial({ color: 0xff0000 });
+  const geometry = new THREE.BufferGeometry().setFromPoints([pPos, hPos]);
+  collisionLine = new THREE.Line(geometry, material);
+  scene.add(collisionLine);
+
+  enterCockpit(payloadData);
+  activeSat.value.hazardName = ev.hazard_name; // Store hazard name to update line dynamically
+  isExploding.value = true;
+}
+
 function resetAfterCollision() {
   isExploding.value = false;
+  if (collisionLine) {
+    scene.remove(collisionLine);
+    collisionLine.geometry.dispose();
+    collisionLine.material.dispose();
+    collisionLine = null;
+  }
   exitCockpit();
 }
 
-function onLayerChange(layers) {
-  activeLayers.value = { ...layers };
-  // 3D scene handles this in tick() using updatePoints()
+function onLayerChange(payload) {
+  activeLayers.value[payload.key] = payload.on;
 }
 </script>

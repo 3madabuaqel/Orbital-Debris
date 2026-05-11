@@ -1,170 +1,267 @@
 import math
-from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
+import hnswlib
+from xgboost import XGBRegressor
+from sklearn.isotonic import IsotonicRegression
 import logging
+from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
-# Constants for realistic simulation
-EARTH_RADIUS_KM = 6371.0
-LEO_MIN_ALT = 200
-LEO_MAX_ALT = 2000
-BIN_SIZE_KM = 50
+SIGMA_KM = 1.0  
+HBR_KM = 0.02   
 
-def parse_altitude(tle2):
-    """Estimate mean altitude from TLE Line 2 Mean Motion."""
+def train_calibrated_model():
+    """
+    Trains a high-fidelity synthetic XGBoost model with Physics-driven Monte Carlo noise
+    and calibrates it using Isotonic Regression.
+    Features: [miss_dist, rel_vel, tca, col_angle, closing_vel_proj, energy_proxy, orbital_region_id, uncert_rad]
+    """
+    logger.info("Initializing and training High-Fidelity XGBoost Regressor with Calibration...")
+    X_synth = []
+    y_synth = []
+    
+    np.random.seed(42)
+    for _ in range(50000):
+        miss_dist = np.random.exponential(scale=5.0) 
+        rel_vel = np.random.uniform(0.1, 15.0)   
+        tca = np.random.exponential(scale=60.0)  
+        col_angle = np.random.uniform(0, math.pi)
+        
+        closing_vel_proj = rel_vel * math.cos(col_angle)
+        energy_proxy = 0.5 * (rel_vel**2)
+        orbital_region_id = np.random.choice([0, 1, 2])
+        
+        # Time-based uncertainty radius (grows with TCA) + noise
+        uncert_rad = 1.0 + (0.01 * tca) + np.random.normal(0, 0.2)
+        uncert_rad = max(0.1, uncert_rad)
+        
+        # Improved Probability Model
+        pc_exponent = -(miss_dist**2) / (2 * uncert_rad**2)
+        raw_pc = math.exp(pc_exponent) * 1e-4
+        
+        v_factor = 1.0 + (energy_proxy / 100.0)
+        geom_factor = 1.0 + (math.pi - col_angle) / math.pi
+        
+        raw_pc = raw_pc * v_factor * geom_factor
+        
+        # Noise injection to simulate orbital uncertainty bias
+        raw_pc *= np.random.lognormal(mean=0.0, sigma=0.3)
+        
+        risk_percentage = min(100.0, (raw_pc / 1e-4) * 100.0)
+        
+        X_synth.append([miss_dist, rel_vel, tca, col_angle, closing_vel_proj, energy_proxy, orbital_region_id, uncert_rad])
+        y_synth.append(risk_percentage)
+        
+    X_synth = np.array(X_synth)
+    y_synth = np.array(y_synth)
+    
+    model = XGBRegressor(
+        n_estimators=300, 
+        max_depth=6, 
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    model.fit(X_synth, y_synth)
+    
+    # Calibration Layer (Isotonic Regression)
+    preds = model.predict(X_synth)
+    calibrator = IsotonicRegression(out_of_bounds='clip')
+    calibrator.fit(preds, y_synth)
+    
+    logger.info("High-Fidelity XGBoost & Calibrator trained successfully.")
+    return model, calibrator
+
+# Train models once at startup
+xgb_model, calibrator = train_calibrated_model()
+
+def calculate_conjunction_physics(p_row, h_row):
+    """Calculates true 3D relative kinematics including collision angle."""
     try:
-        # Mean motion is cols 52-63
-        mm_str = tle2[52:63].strip()
-        mean_motion = float(mm_str) # revs per day
-        # Kepler's third law: a^3 = mu / (n * 2pi/86400)^2
-        mu = 398600.4418 # Earth's gravitational constant km^3/s^2
-        n_rad_s = mean_motion * 2 * math.pi / 86400.0
-        a = (mu / (n_rad_s ** 2)) ** (1.0/3.0)
-        alt = a - EARTH_RADIUS_KM
-        return alt
+        rA = np.array([p_row['x'], p_row['y'], p_row['z']])
+        vA = np.array([p_row['vx'], p_row['vy'], p_row['vz']])
+        
+        rB = np.array([h_row['x'], h_row['y'], h_row['z']])
+        vB = np.array([h_row['vx'], h_row['vy'], h_row['vz']])
+        
+        dr = rA - rB
+        dv = vA - vB
+        
+        rel_vel = np.linalg.norm(dv)
+        if rel_vel == 0:
+            return 9999.0, 0.0, 0.0, 0.0
+            
+        norm_vA = np.linalg.norm(vA)
+        norm_vB = np.linalg.norm(vB)
+        if norm_vA > 0 and norm_vB > 0:
+            cos_theta = np.clip(np.dot(vA, vB) / (norm_vA * norm_vB), -1.0, 1.0)
+            col_angle = np.arccos(cos_theta)
+        else:
+            col_angle = 0.0
+            
+        tca = -np.dot(dr, dv) / np.dot(dv, dv)
+        if tca < 0:
+            tca = 0.0
+            
+        dr_min = dr + dv * tca
+        miss_dist = np.linalg.norm(dr_min)
+        
+        return miss_dist, rel_vel, tca, col_angle
     except Exception:
-        return None
+        return 9999.0, 0.0, 0.0, 0.0
 
-def atmospheric_density(alt):
-    """Very simplified exponential atmospheric model."""
-    # base values at 500km
-    rho0 = 1e-12 # kg/m^3 (approx)
-    H = 50.0 # scale height km
-    return rho0 * math.exp(-(alt - 500) / H)
+def get_regime(alt):
+    if alt <= 2000: return 0
+    if alt <= 35786: return 1
+    return 2
 
-def calculate_decay_rate(alt, mass_kg=500.0, area_m2=1.0):
+def run_prediction(df: pd.DataFrame, current_time, time_horizon_years: int = 50) -> dict:
     """
-    Calculates orbital decay rate in km/year.
-    da/dt roughly proportional to rho * A/m * v^2
+    Advanced Time-Aware Prediction Engine.
+    Performs multi-step SGP4 propagation and aggregates weighted risks from top-K hazards 
+    using Regime-Split HNSW spatial indices.
     """
-    rho = atmospheric_density(alt)
-    a = alt + EARTH_RADIUS_KM
-    v = math.sqrt(398600.4418 / a) * 1000 # m/s
-    # simplified decay rate formula
-    decay_m_s = (rho * area_m2 / mass_kg) * (v ** 2)
-    decay_km_yr = decay_m_s * 31536000 / 1000.0 * 50 # Amplification factor to make it visible in 50 yrs
-    return max(0, decay_km_yr)
-
-def run_prediction(df: pd.DataFrame, time_horizon_years: int = 50) -> dict:
-    """
-    NASA-like Probabilistic orbital risk analysis.
-    Uses orbital decay (atmospheric drag) and probabilistic Kessler Syndrome.
-    """
-    logger.info(f"Starting realistic prediction for {time_horizon_years} years")
+    logger.info("Running Advanced Time-Aware Prediction Engine...")
     
-    bins = np.arange(LEO_MIN_ALT, LEO_MAX_ALT + BIN_SIZE_KM, BIN_SIZE_KM)
-    bin_counts = {int(b): 0 for b in bins[:-1]}
+    from propagator import compute_positions
     
-    # 1. Initial State Initialization
-    valid_objects = 0
-    for _, row in df.iterrows():
-        try:
-            tle2 = row.get('tle2', '')
-            alt = parse_altitude(tle2)
-            if alt is not None and LEO_MIN_ALT <= alt < LEO_MAX_ALT:
-                b = int(alt // BIN_SIZE_KM * BIN_SIZE_KM)
-                if b in bin_counts:
-                    bin_counts[b] += 1
-                valid_objects += 1
-        except Exception:
-            pass
-
-    if valid_objects == 0:
-        return {"error": "No valid objects found in LEO for prediction."}
-
-    total_objects_history = []
-    zone_risk = {f"{b}-{b+BIN_SIZE_KM}km": 0 for b in bin_counts.keys()}
-    
-    # Kessler parameters
-    rel_velocity_km_s = 10.0
-    avg_cross_section_km2 = 10.0 / 1000000.0 # 10 sq meters in sq km
-    seconds_per_year = 31536000
-    
-    # 2. Year-by-Year Simulation
-    for year in range(1, time_horizon_years + 1):
-        new_counts = {int(b): 0 for b in bins[:-1]}
-        year_collisions = 0
-        
-        for b in sorted(bin_counts.keys()):
-            N = bin_counts[b]
-            if N <= 0:
-                continue
-                
-            # Volume of the spherical shell
-            r1 = EARTH_RADIUS_KM + b
-            r2 = r1 + BIN_SIZE_KM
-            volume = (4.0/3.0) * math.pi * (r2**3 - r1**3)
-            
-            # Collision Probability calculation (Particle in box)
-            expected_collisions = 0.5 * (N * N * avg_cross_section_km2 * rel_velocity_km_s * seconds_per_year) / volume
-            
-            # Probabilistic actual collisions
-            actual_collisions = np.random.poisson(expected_collisions)
-            year_collisions += actual_collisions
-            zone_risk[f"{b}-{b+BIN_SIZE_KM}km"] += actual_collisions
-            
-            # Fragmentation (NASA Standard Breakup Model simplification)
-            fragments_generated = actual_collisions * 500 # Generate 500 trackable fragments per collision
-            N += fragments_generated
-            
-            # Orbital Decay
-            decay_km = calculate_decay_rate(b)
-            # Distribute N downward probabilistically or discretely
-            bins_down = int(decay_km // BIN_SIZE_KM)
-            
-            # For a more continuous feel, shift a portion to the lower bin
-            fraction_down = (decay_km % BIN_SIZE_KM) / BIN_SIZE_KM
-            
-            # The objects that don't shift a full bin
-            target_bin = int(b - bins_down * BIN_SIZE_KM)
-            target_bin_lower = target_bin - BIN_SIZE_KM
-            
-            if target_bin >= LEO_MIN_ALT and target_bin in new_counts:
-                new_counts[target_bin] += int(N * (1 - fraction_down))
-            
-            if target_bin_lower >= LEO_MIN_ALT and target_bin_lower in new_counts:
-                new_counts[target_bin_lower] += int(N * fraction_down)
-                
-        bin_counts = new_counts
-        current_total = sum(bin_counts.values())
-        
-        total_objects_history.append({
-            "year": year,
-            "total_objects": int(current_total),
-            "collisions_this_year": int(year_collisions)
-        })
-
-    total_current_objects = sum(bin_counts.values())
-    
-    # Calculate global risk index based on exponential growth
-    growth_ratio = total_current_objects / max(1, valid_objects)
-    
-    # Normalize risk index 0 to 1
-    if growth_ratio > 1:
-        global_risk_index = min(1.0, math.log10(growth_ratio) / 2.0)
-    else:
-        global_risk_index = max(0.0, growth_ratio - 0.5)
-    
-    sorted_zones = sorted(zone_risk.items(), key=lambda x: x[1], reverse=True)
-    high_risk_zones = [
-        {"altitude_range": zone, "congestion_events": int(events)} 
-        for zone, events in sorted_zones[:5] if events > 0
+    time_steps = [
+        ("t0", 0),
+        ("t+10m", 10),
+        ("t+30m", 30),
+        ("t+1h", 60),
+        ("t+6h", 360)
     ]
     
-    trend = "stable"
-    if growth_ratio > 1.2:
-        trend = "increasing (Kessler Syndrome Warning)"
-    elif growth_ratio < 0.9:
-        trend = "decreasing (Atmospheric cleaning dominant)"
+    payload_risk_profiles = {}
+    
+    for step_name, offset_minutes in time_steps:
+        eval_time = current_time + timedelta(minutes=offset_minutes)
+        # SGP4 Propagate to this time step
+        pos_df = compute_positions(df, eval_time)
+        
+        req_cols = ['x', 'y', 'z', 'vx', 'vy', 'vz', 'alt']
+        payloads = pos_df[pos_df['type'] == 'PAYLOAD'].dropna(subset=req_cols).copy()
+        hazards = pos_df[pos_df['type'].isin(['DEBRIS', 'ROCKET BODY'])].dropna(subset=req_cols).copy()
+        
+        if payloads.empty or hazards.empty:
+            continue
+            
+        payloads['regime'] = payloads['alt'].apply(get_regime)
+        hazards['regime'] = hazards['alt'].apply(get_regime)
+        
+        # Regime-Split HNSW Indexing
+        indices = {}
+        for r in [0, 1, 2]:
+            h_sub = hazards[hazards['regime'] == r].copy()
+            if len(h_sub) > 0:
+                h_coords = h_sub[['x', 'y', 'z']].values.astype('float32')
+                p = hnswlib.Index(space='l2', dim=3)
+                p.init_index(max_elements=len(h_coords), ef_construction=100, M=16)
+                p.add_items(h_coords, np.arange(len(h_coords)))
+                p.set_ef(50)
+                indices[r] = (p, h_sub.reset_index(drop=True))
+                
+        # Evaluate Payload Risks
+        for r in [0, 1, 2]:
+            p_sub = payloads[payloads['regime'] == r].reset_index(drop=True)
+            if len(p_sub) == 0 or r not in indices:
+                continue
+                
+            p_index, h_df = indices[r]
+            p_coords = p_sub[['x', 'y', 'z']].values.astype('float32')
+            
+            # Top-K evaluation per orbital region
+            k = min(5, len(h_df))
+            labels, distances = p_index.knn_query(p_coords, k=k)
+            
+            for i in range(len(p_sub)):
+                p_row = p_sub.iloc[i]
+                pid = str(p_row['name'])
+                
+                if pid not in payload_risk_profiles:
+                    payload_risk_profiles[pid] = {
+                        'satellite': {'name': pid},
+                        'max_risk': -1.0,
+                        'time_of_max_risk': None,
+                        'max_risk_details': None
+                    }
+                
+                step_features = []
+                step_hazards = []
+                
+                for j in range(k):
+                    h_idx = labels[i][j]
+                    h_row = h_df.iloc[h_idx]
+                    
+                    miss_dist, rel_vel, tca, col_angle = calculate_conjunction_physics(p_row, h_row)
+                    closing_vel_proj = rel_vel * math.cos(col_angle)
+                    energy_proxy = 0.5 * (rel_vel**2)
+                    uncert_rad = 1.0 + (0.01 * tca)
+                    
+                    step_features.append([miss_dist, rel_vel, tca, col_angle, closing_vel_proj, energy_proxy, r, uncert_rad])
+                    step_hazards.append(h_row)
+                    
+                if step_features:
+                    X_pred = np.array(step_features)
+                    raw_preds = xgb_model.predict(X_pred)
+                    calibrated_preds = calibrator.predict(raw_preds)
+                    
+                    # Aggregate TOTAL_RISK = Σ (risk_i * exp(-distance_weight))
+                    total_step_risk = 0.0
+                    for idx_h, pred_risk in enumerate(calibrated_preds):
+                        dist = step_features[idx_h][0]
+                        weighted_risk = max(0, pred_risk) * math.exp(-dist / 50.0)
+                        total_step_risk += weighted_risk
+                        
+                    if total_step_risk > payload_risk_profiles[pid]['max_risk']:
+                        max_idx = np.argmax(calibrated_preds)
+                        payload_risk_profiles[pid]['max_risk'] = total_step_risk
+                        payload_risk_profiles[pid]['time_of_max_risk'] = step_name
+                        payload_risk_profiles[pid]['max_risk_details'] = {
+                            'hazard': str(step_hazards[max_idx]['name']),
+                            'miss_dist': step_features[max_idx][0],
+                            'rel_vel': step_features[max_idx][1],
+                            'tca': step_features[max_idx][2] + (offset_minutes * 60)
+                        }
+
+    # Format Results
+    results_list = list(payload_risk_profiles.values())
+    results_list.sort(key=lambda x: x['max_risk'], reverse=True)
+    top_risks = results_list[:15]
+    
+    formatted_events = []
+    for r in top_risks:
+        if r['max_risk_details']:
+            formatted_events.append({
+                'satellite': r['satellite'],
+                'tca': f"TCA: {r['max_risk_details']['tca']:.1f}s",
+                'probability': f"{min(100.0, r['max_risk']):.2f}%",
+                'kineticEnergy': f"Rel.Vel: {r['max_risk_details']['rel_vel']:.1f}km/s",
+                'hazard_name': r['max_risk_details']['hazard'],
+                
+                # Enhanced output structure requested by user
+                'max_risk_over_time': float(min(100.0, r['max_risk'])),
+                'time_of_max_risk': r['time_of_max_risk'],
+                'risk_breakdown': {
+                    'distance_contribution': float(math.exp(-r['max_risk_details']['miss_dist']/50.0)),
+                    'temporal_contribution': r['time_of_max_risk']
+                }
+            })
+
+    # Global metrics
+    all_risks = [r['max_risk'] for r in results_list if r['max_risk'] > 0]
+    global_risk_index = (np.mean(all_risks) / 100.0) if all_risks else 0.0
+    trend = "CRITICAL RISK" if global_risk_index > 0.4 else "Nominal Protection"
 
     return {
         "time_horizon_years": time_horizon_years,
-        "global_risk_index": round(global_risk_index, 3),
-        "high_risk_zones": high_risk_zones,
-        "total_objects_history": total_objects_history,
+        "global_risk_index": float(global_risk_index),
+        "high_risk_zones": formatted_events, 
         "trend": trend,
-        "initial_object_count": valid_objects,
-        "final_object_count": int(total_current_objects)
+        "initial_object_count": len(df),
+        "final_object_count": len(df)
     }

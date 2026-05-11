@@ -9,9 +9,10 @@ logger = logging.getLogger(__name__)
 
 def compute_positions(df, utc_datetime):
     """
-    Propagate all satellites to a given UTC datetime.
+    Computes precise spatial positions and velocity vectors for all orbital objects 
+    at a specific UTC time using the SGP4 mathematical model.
+    Filters out decayed or invalid objects.
     """
-
     t = ts.utc(
         utc_datetime.year,
         utc_datetime.month,
@@ -66,6 +67,11 @@ def compute_positions(df, utc_datetime):
                 'x': clean_float(pos[0]),
                 'y': clean_float(pos[1]),
                 'z': clean_float(pos[2]),
+                
+                # Cartesian velocity vectors
+                'vx': clean_float(vel[0]),
+                'vy': clean_float(vel[1]),
+                'vz': clean_float(vel[2]),
                 
                 # High-fidelity parameters for UI
                 'inclination': clean_float(inclination),

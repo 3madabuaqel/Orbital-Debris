@@ -1,21 +1,20 @@
 import pandas as pd
 import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 import os
 import glob
 from skyfield.api import EarthSatellite, load
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 ts = load.timescale()
 
 def load_catalogue(data_path: str) -> pd.DataFrame:
     """
-    Load and validate TLE catalogue from a directory of CSVs or a single CSV.
+    Dynamically loads and validates TLE data from a single CSV or a directory of CSVs.
+    Converts valid TLE pairs into precomputed Skyfield EarthSatellite objects.
     """
-
     try:
         csv_files = []
         if os.path.isdir(data_path):
@@ -32,19 +31,12 @@ def load_catalogue(data_path: str) -> pd.DataFrame:
         processed_data = []
 
         for csv_path in csv_files:
-            logger.info(f"Reading dataset: {csv_path}")
+            logger.info(f"Ingesting dataset: {csv_path}")
             df_raw = pd.read_csv(csv_path)
 
-            required = [
-                'TLE_LINE1',
-                'TLE_LINE2',
-                'OBJECT_NAME',
-                'OBJECT_TYPE',
-                'NORAD_CAT_ID'
-            ]
-
+            required = ['TLE_LINE1', 'TLE_LINE2', 'OBJECT_NAME', 'OBJECT_TYPE', 'NORAD_CAT_ID']
             if not all(col in df_raw.columns for col in required):
-                logger.error(f"Missing mandatory columns in {csv_path}. Found: {list(df_raw.columns)}")
+                logger.error(f"Missing mandatory columns in {csv_path}.")
                 continue
 
             for _, row in df_raw.iterrows():
@@ -52,7 +44,7 @@ def load_catalogue(data_path: str) -> pd.DataFrame:
                     l1 = str(row['TLE_LINE1']).strip()
                     l2 = str(row['TLE_LINE2']).strip()
 
-                    # Basic TLE validation
+                    # Basic TLE syntax validation
                     if not l1.startswith("1 ") or not l2.startswith("2 "):
                         continue
 
@@ -63,32 +55,24 @@ def load_catalogue(data_path: str) -> pd.DataFrame:
                         'rcs_size': row.get('RCS_SIZE', 'UNKNOWN'),
                         'country': row.get('COUNTRY', 'UNKNOWN'),
                         'period': row.get('PERIOD', 0),
-
-                        # Precompute Skyfield satellite object
                         'sat_obj': EarthSatellite(l1, l2, str(row['OBJECT_NAME']).strip(), ts),
-
-                        # Keep raw TLE only
                         'tle1': l1,
                         'tle2': l2
                     })
 
-                except Exception as e:
-                    # Silently skip corrupted row
+                except Exception:
+                    # Silently skip corrupted rows to maintain loading performance
                     continue
 
         df_final = pd.DataFrame(processed_data)
         
         if not df_final.empty:
-            # Remove duplicates in case multiple CSVs contain the same satellite ID
+            # Drop cross-file duplicates favoring the latest ingested record
             df_final.drop_duplicates(subset=['id'], keep='last', inplace=True)
 
-        logger.info(
-            f"✅ Successfully loaded {len(df_final)} unique "
-            f"orbital objects from {len(csv_files)} files."
-        )
-
+        logger.info(f"Successfully loaded {len(df_final)} unique orbital objects.")
         return df_final
 
     except Exception as e:
-        logger.error(f"❌ Critical error during catalogue loading: {e}")
+        logger.error(f"Critical error during catalogue loading: {e}")
         return pd.DataFrame()

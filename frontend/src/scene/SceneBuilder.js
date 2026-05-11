@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 const TEXTURES = {
   earth: 'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/planets/earth_atmos_2048.jpg',
@@ -117,50 +118,93 @@ export function buildStarfield(scene) {
   scene.add(new THREE.Points(geo, mat));
 }
 
-// ───────────────────────────── SATELLITE CLOUD (FIXED) ─────────────────────────────
-export function buildSatelliteCloud(scene, count) {
-  const geometry = new THREE.BufferGeometry();
+// ───────────────────────────── DETAILED 3D GEOMETRIES ─────────────────────────────
+function createSatelliteGeometry() {
+  const bodyGeo = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+  
+  const panel1 = new THREE.BoxGeometry(1.8, 0.05, 0.4);
+  panel1.translate(1.2, 0, 0);
+  
+  const panel2 = new THREE.BoxGeometry(1.8, 0.05, 0.4);
+  panel2.translate(-1.2, 0, 0);
+  
+  const merged = BufferGeometryUtils.mergeGeometries([bodyGeo, panel1, panel2]);
+  return merged;
+}
 
-  const positions = new Float32Array(count * 3);
-  const colors = new Float32Array(count * 3);
+function createRocketGeometry() {
+  const stage = new THREE.CylinderGeometry(0.2, 0.2, 1.2, 16);
+  
+  const cone = new THREE.ConeGeometry(0.2, 0.4, 16);
+  cone.translate(0, 0.8, 0);
+  
+  const nozzle = new THREE.CylinderGeometry(0.15, 0.05, 0.3, 16);
+  nozzle.translate(0, -0.75, 0);
+  
+  const merged = BufferGeometryUtils.mergeGeometries([stage, cone, nozzle]);
+  return merged;
+}
 
-  for (let i = 0; i < count; i++) {
-    positions[i * 3] = 0;
-    positions[i * 3 + 1] = 0;
-    positions[i * 3 + 2] = 0;
+function createDebrisGeometry() {
+  const t1 = new THREE.TetrahedronGeometry(0.4, 0);
+  
+  const t2 = new THREE.TetrahedronGeometry(0.3, 0);
+  t2.rotateX(Math.PI / 4);
+  t2.translate(0.2, 0.1, -0.1);
+  
+  const t3 = new THREE.TetrahedronGeometry(0.25, 0);
+  t3.rotateY(Math.PI / 3);
+  t3.translate(-0.1, -0.2, 0.2);
+  
+  const merged = BufferGeometryUtils.mergeGeometries([t1, t2, t3]);
+  return merged;
+}
 
-    // default hidden color
-    colors[i * 3] = 0;
-    colors[i * 3 + 1] = 0;
-    colors[i * 3 + 2] = 0;
-  }
+// ───────────────────────────── INSTANCED SATELLITES ─────────────────────────────
+export function buildInstancedSatellites(scene, counts) {
+  const dummy = new THREE.Object3D();
+  dummy.scale.set(0, 0, 0);
+  dummy.updateMatrix();
 
-  geometry.setAttribute(
-    'position',
-    new THREE.BufferAttribute(positions, 3)
-  );
-
-  geometry.setAttribute(
-    'color',
-    new THREE.BufferAttribute(colors, 3)
-  );
-
-  const material = new THREE.PointsMaterial({
-    size: 0.4,
-    sizeAttenuation: true,
-    vertexColors: true,
-    transparent: true,
-    opacity: 1.0,
-    depthWrite: false
+  // 1. Payloads -> Realistic Satellite
+  const payloadGeo = createSatelliteGeometry();
+  const payloadMat = new THREE.MeshPhongMaterial({ 
+    color: 0x88ccff, emissive: 0x112244, shininess: 100 
   });
+  const payloadMesh = new THREE.InstancedMesh(payloadGeo, payloadMat, counts.payload);
+  payloadMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  payloadMesh.frustumCulled = false;
+  scene.add(payloadMesh);
 
-  const points = new THREE.Points(geometry, material);
+  // 2. Rocket Bodies -> Realistic Rocket Stage
+  const rocketGeo = createRocketGeometry();
+  const rocketMat = new THREE.MeshPhongMaterial({ 
+    color: 0xffaa00, emissive: 0x442200, shininess: 80 
+  });
+  const rocketMesh = new THREE.InstancedMesh(rocketGeo, rocketMat, counts.rocket);
+  rocketMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  rocketMesh.frustumCulled = false;
+  scene.add(rocketMesh);
 
-  points.frustumCulled = false; // 🔥 مهم جدًا (يمنع اختفاء النقاط)
+  // 3. Debris -> Realistic Jagged Fragments
+  const debrisGeo = createDebrisGeometry();
+  const debrisMat = new THREE.MeshPhongMaterial({ 
+    color: 0xaaaaaa, emissive: 0x222222, shininess: 50 
+  });
+  const debrisMesh = new THREE.InstancedMesh(debrisGeo, debrisMat, counts.debris);
+  debrisMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  debrisMesh.frustumCulled = false;
+  scene.add(debrisMesh);
 
-  scene.add(points);
+  for (let i = 0; i < counts.payload; i++) payloadMesh.setMatrixAt(i, dummy.matrix);
+  for (let i = 0; i < counts.rocket; i++) rocketMesh.setMatrixAt(i, dummy.matrix);
+  for (let i = 0; i < counts.debris; i++) debrisMesh.setMatrixAt(i, dummy.matrix);
 
-  return points;
+  payloadMesh.instanceMatrix.needsUpdate = true;
+  rocketMesh.instanceMatrix.needsUpdate = true;
+  debrisMesh.instanceMatrix.needsUpdate = true;
+
+  return { payloadMesh, rocketMesh, debrisMesh };
 }
 // ───────────────────────────── CUBE SAT ─────────────────────────────
 export function buildCubeSat(scene) {
